@@ -1,0 +1,149 @@
+#include <Wire.h>
+#include "LoRaWan_APP.h"
+#include "Adafruit_SCD30.h"
+#include <BMP280_DEV.h>
+
+#define ACTIVE_REGION LORAMAC_REGION_EU868
+
+Adafruit_SCD30 scd30;
+BMP280_DEV bmp280;
+
+uint8_t devEui[] = { ******* }; // was hidden 
+uint8_t appEui[] = { ****** };  // was hidden 
+uint8_t appKey[] = { ******* };  // was hidden
+ 
+uint16_t userChannelsMask[6] = { 0x00FF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 };
+bool isTxConfirmed = false;
+uint8_t confirmedNbTrials = 4;
+bool overTheAirActivation = true;
+DeviceClass_t loraWanClass = CLASS_A;
+bool loraWanAdr = true;
+uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85 };
+uint8_t appSKey[] = { 0xd7, 0x2c, 0x78, 0x75, 0x8c, 0xdc, 0xca, 0xbf, 0x55, 0xee, 0x4a, 0x77, 0x8d, 0x16, 0xef, 0x67 };
+uint32_t devAddr = (uint32_t)0x007e6ae1;
+
+uint32_t appTxDutyCycle = 60 * 1000; // Transmit every 60 seconds
+uint8_t appPort = 2;
+
+unsigned long previousMillis = 0;
+const unsigned long interval = 2000;
+
+float pressure,temperature1,altitude;
+
+static void prepareTxFrame(uint8_t port) {
+  if (scd30.dataReady()) {
+    if (scd30.read()) {
+      uint16_t temp_scd30 = (uint16_t)(scd30.temperature * 10); // Temp in 0.1°C
+      uint16_t hum_scd30 = (uint16_t)(scd30.relative_humidity * 10); // Humidity in 0.1%
+      uint16_t co2_scd30 = (uint16_t)scd30.CO2;
+
+      // Read BMP280 data
+      if (bmp280.getMeasurements(temperature1, pressure, altitude)) {
+        uint16_t pres_bmp280 = (uint16_t)(pressure / 10);    // Pressure in 0.1 hPa
+
+        // Prepare LoRa payload (10 bytes: 6 from SCD30 + 4 from BMP280)
+        appDataSize = 10;
+
+        // SCD30 data
+        appData[0] = (co2_scd30 >> 8) & 0xFF;
+        appData[1] = co2_scd30 & 0xFF;
+        appData[2] = (temp_scd30 >> 8) & 0xFF;
+        appData[3] = temp_scd30 & 0xFF;
+        appData[4] = (hum_scd30 >> 8) & 0xFF;
+        appData[5] = hum_scd30 & 0xFF;
+
+        // BMP280 data
+        appData[6] = (pres_bmp280 >> 8) & 0xFF;
+        appData[7] = pres_bmp280 & 0xFF;
+      } else {
+        Serial.println("Failed to read data from BMP280.");
+      }
+    } else {
+      Serial.println("Failed to read data from SCD30.");
+    }
+  } else {
+    Serial.println("SCD30 data not ready.");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(41, 42);
+
+  // Initialize SCD30
+  if (!scd30.begin()) {
+    Serial.println("Error: SCD30 not found!");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  // Initialize BMP280
+  if (!bmp280.begin(0x76)) {
+    Serial.println("Error: BMP280 not found!");
+    while (1) {
+      delay(1000);
+    }
+  }
+  bmp280.setTimeStandby(TIME_STANDBY_2000MS);
+  bmp280.startNormalConversion();
+
+  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+  LoRaWAN.init(loraWanClass, ACTIVE_REGION);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    // Print SCD30 data
+    Serial.print("SCD30 - CO2: ");
+    Serial.print(scd30.CO2);
+    Serial.print(" ppm, Temp: ");
+    Serial.print(scd30.temperature);
+    Serial.print(" °C, Humidity: ");
+    Serial.print(scd30.relative_humidity);
+    Serial.println(" %");
+
+    // Print BMP280 data
+    if (bmp280.getMeasurements(temperature1, pressure, altitude)) {
+      Serial.print("BMP280 - Pressure: ");
+      Serial.print(pressure);
+      Serial.println(" hPa");
+    }
+  }
+
+  // Handle LoRaWAN state machine
+  switch (deviceState) {
+    case DEVICE_STATE_INIT:
+      LoRaWAN.setDefaultDR(3);
+      deviceState = DEVICE_STATE_JOIN;
+      break;
+
+    case DEVICE_STATE_JOIN:
+      LoRaWAN.join();
+      break;
+
+    case DEVICE_STATE_SEND:
+      prepareTxFrame(appPort);
+      LoRaWAN.send();
+      deviceState = DEVICE_STATE_CYCLE;
+      break;
+
+    case DEVICE_STATE_CYCLE:
+      txDutyCycleTime = appTxDutyCycle + randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
+      LoRaWAN.cycle(txDutyCycleTime);
+      deviceState = DEVICE_STATE_SLEEP;
+      break;
+
+    case DEVICE_STATE_SLEEP:
+      LoRaWAN.sleep(CLASS_A);
+      break;
+
+    default:
+      deviceState = DEVICE_STATE_INIT;
+      break;
+  }
+}
